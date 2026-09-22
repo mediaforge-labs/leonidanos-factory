@@ -7,6 +7,7 @@ on:
       - main
     paths:
       - '.github/workflows/factory.yml'
+      - 'public-worker-template/**'
   schedule:
     - cron: '*/15 * * * *'
 
@@ -17,18 +18,40 @@ concurrency:
   group: leonidanos-factory-render-${{ github.event_name == 'schedule' && 'scheduled' || github.run_id }}
   cancel-in-progress: false
 
+env:
+  SUPABASE_URL: https://rhddgfvtrkmusbvphnlg.supabase.co
+  MEDIAFORGE_MUSIC_ENABLED: '0'
+
 jobs:
+  static-check:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Validate clean factory code
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            public-worker-template/worker.py \
+            public-worker-template/supabase_chunked.py \
+            public-worker-template/factory_worker.py
+          grep -q 'music_enabled", False' public-worker-template/factory_worker.py
+          ! grep -R -E 'dell_asset|LEONIDANOS_MEDIA_ROOT|self-hosted|gateway|tunnel' public-worker-template .github/workflows/factory.yml
+          echo 'Static clean-factory validation passed; music is disabled.'
+
   probe:
-    if: ${{ github.event_name != 'schedule' || vars.FACTORY_ENABLED == 'true' }}
+    if: ${{ github.event_name != 'push' && (github.event_name != 'schedule' || vars.FACTORY_ENABLED == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       has_work: ${{ steps.queue.outputs.has_work }}
     env:
-      SUPABASE_URL: https://rhddgfvtrkmusbvphnlg.supabase.co
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      HAS_SUPABASE: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY != '' }}
-      HAS_CORE_BUNDLE: ${{ secrets.MEDIAFORGE_CORE_BUNDLE_B64 != '' }}
       HAS_CORE_KEY: ${{ secrets.MEDIAFORGE_CORE_KEY_B64 != '' }}
       HAS_VOICE_REFERENCE: ${{ secrets.MEDIAFORGE_VOICE_REFERENCE_B64 != '' }}
     steps:
@@ -36,8 +59,8 @@ jobs:
         run: |
           set -euo pipefail
           missing=()
-          [ "$HAS_SUPABASE" = 'true' ] || missing+=(SUPABASE_SERVICE_ROLE_KEY)
-          [ "$HAS_CORE_BUNDLE" = 'true' ] || missing+=(MEDIAFORGE_CORE_BUNDLE_B64)
+          SUPABASE_KEY="${SUPABASE_SECRET_KEY:-${SUPABASE_SERVICE_ROLE_KEY:-}}"
+          [ -n "$SUPABASE_KEY" ] || missing+=(SUPABASE_SECRET_KEY_or_SUPABASE_SERVICE_ROLE_KEY)
           [ "$HAS_CORE_KEY" = 'true' ] || missing+=(MEDIAFORGE_CORE_KEY_B64)
           [ "$HAS_VOICE_REFERENCE" = 'true' ] || missing+=(MEDIAFORGE_VOICE_REFERENCE_B64)
           if [ ${#missing[@]} -gt 0 ]; then
@@ -48,9 +71,10 @@ jobs:
         id: queue
         run: |
           set -euo pipefail
-          auth=(-H "apikey: $SUPABASE_SERVICE_ROLE_KEY")
-          if [[ "$SUPABASE_SERVICE_ROLE_KEY" != sb_secret_* ]]; then
-            auth+=(-H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY")
+          SUPABASE_KEY="${SUPABASE_SECRET_KEY:-${SUPABASE_SERVICE_ROLE_KEY:-}}"
+          auth=(-H "apikey: $SUPABASE_KEY")
+          if [[ "$SUPABASE_KEY" != sb_secret_* ]]; then
+            auth+=(-H "Authorization: Bearer $SUPABASE_KEY")
           fi
           NOW_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           PENDING="$(curl --fail --silent --show-error --get \
@@ -95,13 +119,13 @@ jobs:
           - lane: en-2
             locale: en-US
     env:
-      SUPABASE_URL: https://rhddgfvtrkmusbvphnlg.supabase.co
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       MEDIAFORGE_CORE_KEY_B64: ${{ secrets.MEDIAFORGE_CORE_KEY_B64 }}
       MEDIAFORGE_TTS_PROVIDER: chatterbox
       MEDIAFORGE_TTS_MAX_WORKERS: '1'
       MEDIAFORGE_TTS_STRICT_CHUNK_ORDER: '1'
+      MEDIAFORGE_STRICT_UNIQUE_MEDIA: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -133,15 +157,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg
       - name: Materialize encrypted production core
-        env:
-          CORE_BUNDLE_B64: ${{ secrets.MEDIAFORGE_CORE_BUNDLE_B64 }}
         run: |
           set -euo pipefail
-          test -n "$CORE_BUNDLE_B64" || { echo 'MEDIAFORGE_CORE_BUNDLE_B64 is not configured'; exit 1; }
           test -n "$MEDIAFORGE_CORE_KEY_B64" || { echo 'MEDIAFORGE_CORE_KEY_B64 is not configured'; exit 1; }
-          mkdir -p .runtime
-          printf '%s' "$CORE_BUNDLE_B64" | base64 --decode > .runtime/core.bundle.enc
+          mkdir -p .runtime/core-parts
+          CORE_BASE='https://raw.githubusercontent.com/mediaforge-labs/media-pipeline-engine/main/encrypted-core/v7'
+          for part in part-01a.b64 part-01b.b64 part-02.b64 part-03.b64 part-04.b64; do
+            curl --fail --silent --show-error --location "$CORE_BASE/$part" -o ".runtime/core-parts/$part"
+            test -s ".runtime/core-parts/$part"
+          done
+          cat .runtime/core-parts/part-01a.b64 \
+              .runtime/core-parts/part-01b.b64 \
+              .runtime/core-parts/part-02.b64 \
+              .runtime/core-parts/part-03.b64 \
+              .runtime/core-parts/part-04.b64 \
+            | tr -d '\r\n\t ' | base64 --decode > .runtime/core.bundle.enc
           test -s .runtime/core.bundle.enc
+          test "$(stat -c%s .runtime/core.bundle.enc)" -eq 21279
           echo "MEDIAFORGE_BUNDLE_PATH=$(realpath .runtime/core.bundle.enc)" >> "$GITHUB_ENV"
       - name: Materialize canonical human voice reference
         env:
@@ -156,6 +188,7 @@ jobs:
       - name: Lease and render next factory job
         run: |
           set -euo pipefail
+          export MEDIAFORGE_MUSIC_ENABLED=0
           python public-worker-template/factory_worker.py \
             --lane "${{ matrix.lane }}" \
             --locale "${{ matrix.locale }}" \
