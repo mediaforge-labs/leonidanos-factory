@@ -7,13 +7,14 @@ import os
 import requests
 
 BASE = os.environ["SUPABASE_URL"].rstrip("/")
-KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"].strip()
+KEY = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SECRET_KEY") or "").strip()
+if not KEY:
+    raise RuntimeError("Missing Supabase service key")
 H = {"apikey": KEY, "Content-Type": "application/json"}
 if not KEY.startswith("sb_secret_"):
     H["Authorization"] = f"Bearer {KEY}"
 
-CANONICAL_RENDER_PREFIX = "mediaforge-github-v10-strict-watermarked-shorts-v2"
-LEGACY_APPROVED_RENDER_PREFIX = "mediaforge-github-v10-approved-watermark-chunked"
+CANONICAL_RENDER_PREFIX = "leonidanos-factory-v1"
 DIRECT_PREFIX = "supabase://"
 CHUNKED_PREFIX = "supabase-chunked://"
 MAX_LONGFORM_UPLOAD_ATTEMPTS = 5
@@ -41,16 +42,6 @@ def _canonical(row):
     return (
         _hosted(str(row.get("video_url") or ""))
         and str(row.get("render_version") or "").startswith(CANONICAL_RENDER_PREFIX)
-        and row.get("youtube_privacy_status") == "private"
-        and row.get("locale") in {"pt-BR", "en-US"}
-    )
-
-
-def _approved_reconciliation(row):
-    version = str(row.get("render_version") or "")
-    return (
-        _hosted(str(row.get("video_url") or ""))
-        and (version.startswith(CANONICAL_RENDER_PREFIX) or version.startswith(LEGACY_APPROVED_RENDER_PREFIX))
         and row.get("youtube_privacy_status") == "private"
         and row.get("locale") in {"pt-BR", "en-US"}
     )
@@ -89,7 +80,7 @@ def resume_failed(queue_id: str = ""):
         "status": "in.(failed,uploading)", "youtube_privacy_status": "eq.private", "youtube_video_id": "not.is.null",
         "order": "updated_at.asc", "limit": "20",
     }, queue_id))
-    return [x for x in rows if _approved_reconciliation(x) and x.get("youtube_video_id") and x.get("thumbnail_url")]
+    return [x for x in rows if _canonical(x) and x.get("youtube_video_id") and x.get("thumbnail_url")]
 
 
 def shorts_ready(queue_id: str = ""):
