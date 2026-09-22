@@ -27,12 +27,27 @@ jobs:
     env:
       SUPABASE_URL: https://rhddgfvtrkmusbvphnlg.supabase.co
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      HAS_SUPABASE: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY != '' }}
+      HAS_CORE_BUNDLE: ${{ secrets.MEDIAFORGE_CORE_BUNDLE_B64 != '' }}
+      HAS_CORE_KEY: ${{ secrets.MEDIAFORGE_CORE_KEY_B64 != '' }}
+      HAS_VOICE_REFERENCE: ${{ secrets.MEDIAFORGE_VOICE_REFERENCE_B64 != '' }}
     steps:
+      - name: Verify render secrets are configured
+        run: |
+          set -euo pipefail
+          missing=()
+          [ "$HAS_SUPABASE" = 'true' ] || missing+=(SUPABASE_SERVICE_ROLE_KEY)
+          [ "$HAS_CORE_BUNDLE" = 'true' ] || missing+=(MEDIAFORGE_CORE_BUNDLE_B64)
+          [ "$HAS_CORE_KEY" = 'true' ] || missing+=(MEDIAFORGE_CORE_KEY_B64)
+          [ "$HAS_VOICE_REFERENCE" = 'true' ] || missing+=(MEDIAFORGE_VOICE_REFERENCE_B64)
+          if [ ${#missing[@]} -gt 0 ]; then
+            printf 'Missing required render secret: %s\n' "${missing[@]}"
+            exit 1
+          fi
       - name: Check pending or expired clean-factory jobs
         id: queue
         run: |
           set -euo pipefail
-          test -n "$SUPABASE_SERVICE_ROLE_KEY"
           auth=(-H "apikey: $SUPABASE_SERVICE_ROLE_KEY")
           if [[ "$SUPABASE_SERVICE_ROLE_KEY" != sb_secret_* ]]; then
             auth+=(-H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY")
@@ -141,7 +156,6 @@ jobs:
       - name: Lease and render next factory job
         run: |
           set -euo pipefail
-          test -n "$SUPABASE_SERVICE_ROLE_KEY" || { echo 'SUPABASE_SERVICE_ROLE_KEY is not configured'; exit 1; }
           python public-worker-template/factory_worker.py \
             --lane "${{ matrix.lane }}" \
             --locale "${{ matrix.locale }}" \
