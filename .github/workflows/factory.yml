@@ -23,7 +23,7 @@ jobs:
       SUPABASE_URL: https://rhddgfvtrkmusbvphnlg.supabase.co
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
     steps:
-      - name: Check pending or expired jobs
+      - name: Check pending or expired clean-factory jobs
         id: queue
         run: |
           set -euo pipefail
@@ -38,22 +38,22 @@ jobs:
             --data-urlencode 'select=id' \
             --data-urlencode 'status=eq.pending' \
             --data-urlencode 'preferred_backend=eq.github' \
-            --data-urlencode 'stage=in.(mediaforge,production,render)' \
+            --data-urlencode 'metadata->>prepared_by=eq.leonidanos-factory' \
             --data-urlencode 'limit=1')"
           EXPIRED="$(curl --fail --silent --show-error --get \
             "$SUPABASE_URL/rest/v1/youtube_factory_jobs" "${auth[@]}" \
             --data-urlencode 'select=id' \
             --data-urlencode 'status=eq.running' \
             --data-urlencode 'preferred_backend=eq.github' \
-            --data-urlencode 'stage=in.(mediaforge,production,render)' \
+            --data-urlencode 'metadata->>prepared_by=eq.leonidanos-factory' \
             --data-urlencode "lease_expires_at=lt.$NOW_UTC" \
             --data-urlencode 'limit=1')"
           if [ "$PENDING" = '[]' ] && [ "$EXPIRED" = '[]' ]; then
             echo 'has_work=false' >> "$GITHUB_OUTPUT"
-            echo 'No pending MediaForge work.'
+            echo 'No pending clean-factory work.'
           else
             echo 'has_work=true' >> "$GITHUB_OUTPUT"
-            echo 'MediaForge work detected.'
+            echo 'Clean-factory work detected.'
           fi
 
   factory:
