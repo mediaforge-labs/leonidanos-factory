@@ -2,6 +2,11 @@ name: Leonidanos Factory - Render
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/factory.yml'
   schedule:
     - cron: '*/15 * * * *'
 
@@ -14,7 +19,7 @@ concurrency:
 
 jobs:
   probe:
-    if: ${{ github.event_name == 'workflow_dispatch' || vars.FACTORY_ENABLED == 'true' }}
+    if: ${{ github.event_name != 'schedule' || vars.FACTORY_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
