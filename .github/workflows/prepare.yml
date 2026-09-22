@@ -1,0 +1,59 @@
+name: Leonidanos Factory - Prepare
+
+on:
+  workflow_dispatch:
+    inputs:
+      queue_id:
+        description: Optional youtube_queue id. Empty selects the next ready item.
+        required: false
+        default: ''
+      force_retry_failed:
+        description: Requeue a failed factory job even after the automatic retry limit.
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: '*/15 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: leonidanos-factory-prepare
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.FACTORY_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SUPABASE_URL: https://rhddgfvtrkmusbvphnlg.supabase.co
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: youtube-worker/editorial_requirements.txt
+      - name: Install dependencies
+        run: pip install --no-cache-dir -r youtube-worker/editorial_requirements.txt
+      - name: Preflight Python
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            youtube-worker/youtube_voice_common.py \
+            youtube-worker/english_validation_prepare.py \
+            youtube-worker/mediaforge_prepare_jobs.py
+      - name: Prepare PT and EN factory jobs
+        env:
+          QUEUE_ID: ${{ github.event.inputs.queue_id || '' }}
+          FORCE_RETRY: ${{ github.event.inputs.force_retry_failed || 'false' }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ -n "$QUEUE_ID" ]; then args+=(--queue-id "$QUEUE_ID"); fi
+          if [ "$FORCE_RETRY" = "true" ]; then args+=(--force-retry-failed); fi
+          python youtube-worker/mediaforge_prepare_jobs.py "${args[@]}"
