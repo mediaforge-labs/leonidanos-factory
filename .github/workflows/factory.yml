@@ -1,0 +1,145 @@
+name: Leonidanos Factory - Render
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: leonidanos-factory-render-${{ github.event_name == 'schedule' && 'scheduled' || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.FACTORY_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      has_work: ${{ steps.queue.outputs.has_work }}
+    env:
+      SUPABASE_URL: https://rhddgfvtrkmusbvphnlg.supabase.co
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - name: Check pending or expired jobs
+        id: queue
+        run: |
+          set -euo pipefail
+          test -n "$SUPABASE_SERVICE_ROLE_KEY"
+          auth=(-H "apikey: $SUPABASE_SERVICE_ROLE_KEY")
+          if [[ "$SUPABASE_SERVICE_ROLE_KEY" != sb_secret_* ]]; then
+            auth+=(-H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY")
+          fi
+          NOW_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          PENDING="$(curl --fail --silent --show-error --get \
+            "$SUPABASE_URL/rest/v1/youtube_factory_jobs" "${auth[@]}" \
+            --data-urlencode 'select=id' \
+            --data-urlencode 'status=eq.pending' \
+            --data-urlencode 'preferred_backend=eq.github' \
+            --data-urlencode 'stage=in.(mediaforge,production,render)' \
+            --data-urlencode 'limit=1')"
+          EXPIRED="$(curl --fail --silent --show-error --get \
+            "$SUPABASE_URL/rest/v1/youtube_factory_jobs" "${auth[@]}" \
+            --data-urlencode 'select=id' \
+            --data-urlencode 'status=eq.running' \
+            --data-urlencode 'preferred_backend=eq.github' \
+            --data-urlencode 'stage=in.(mediaforge,production,render)' \
+            --data-urlencode "lease_expires_at=lt.$NOW_UTC" \
+            --data-urlencode 'limit=1')"
+          if [ "$PENDING" = '[]' ] && [ "$EXPIRED" = '[]' ]; then
+            echo 'has_work=false' >> "$GITHUB_OUTPUT"
+            echo 'No pending MediaForge work.'
+          else
+            echo 'has_work=true' >> "$GITHUB_OUTPUT"
+            echo 'MediaForge work detected.'
+          fi
+
+  factory:
+    needs: probe
+    if: ${{ needs.probe.outputs.has_work == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - lane: pt-1
+            locale: pt-BR
+          - lane: pt-2
+            locale: pt-BR
+          - lane: en-1
+            locale: en-US
+          - lane: en-2
+            locale: en-US
+    env:
+      SUPABASE_URL: https://rhddgfvtrkmusbvphnlg.supabase.co
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      MEDIAFORGE_CORE_KEY_B64: ${{ secrets.MEDIAFORGE_CORE_KEY_B64 }}
+      MEDIAFORGE_TTS_PROVIDER: chatterbox
+      MEDIAFORGE_TTS_MAX_WORKERS: '1'
+      MEDIAFORGE_TTS_STRICT_CHUNK_ORDER: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            public-worker-template/requirements.txt
+            public-worker-template/requirements-production.txt
+      - name: Preflight production code
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            public-worker-template/worker.py \
+            public-worker-template/supabase_chunked.py \
+            public-worker-template/factory_worker.py
+      - name: Cache Chatterbox models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: chatterbox-multilingual-v3-${{ runner.os }}-${{ runner.arch }}-clean-v1
+      - name: Install production dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip setuptools wheel
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.6.0 torchaudio==2.6.0
+          pip install -r public-worker-template/requirements.txt
+          pip install -r public-worker-template/requirements-production.txt
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Materialize encrypted production core
+        env:
+          CORE_BUNDLE_B64: ${{ secrets.MEDIAFORGE_CORE_BUNDLE_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$CORE_BUNDLE_B64" || { echo 'MEDIAFORGE_CORE_BUNDLE_B64 is not configured'; exit 1; }
+          test -n "$MEDIAFORGE_CORE_KEY_B64" || { echo 'MEDIAFORGE_CORE_KEY_B64 is not configured'; exit 1; }
+          mkdir -p .runtime
+          printf '%s' "$CORE_BUNDLE_B64" | base64 --decode > .runtime/core.bundle.enc
+          test -s .runtime/core.bundle.enc
+          echo "MEDIAFORGE_BUNDLE_PATH=$(realpath .runtime/core.bundle.enc)" >> "$GITHUB_ENV"
+      - name: Materialize canonical human voice reference
+        env:
+          VOICE_REFERENCE_B64: ${{ secrets.MEDIAFORGE_VOICE_REFERENCE_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$VOICE_REFERENCE_B64" || { echo 'MEDIAFORGE_VOICE_REFERENCE_B64 is not configured'; exit 1; }
+          printf '%s' "$VOICE_REFERENCE_B64" | base64 --decode > .runtime/voice-reference.ogg
+          ffmpeg -y -loglevel error -i .runtime/voice-reference.ogg -vn -ac 1 -ar 24000 -c:a pcm_s16le .runtime/voice-reference.wav
+          test -s .runtime/voice-reference.wav
+          echo "MEDIAFORGE_VOICE_REFERENCE_PATH=$(realpath .runtime/voice-reference.wav)" >> "$GITHUB_ENV"
+      - name: Lease and render next factory job
+        run: |
+          set -euo pipefail
+          test -n "$SUPABASE_SERVICE_ROLE_KEY" || { echo 'SUPABASE_SERVICE_ROLE_KEY is not configured'; exit 1; }
+          python public-worker-template/factory_worker.py \
+            --lane "${{ matrix.lane }}" \
+            --locale "${{ matrix.locale }}" \
+            --bundle "$MEDIAFORGE_BUNDLE_PATH" \
+            --worker public-worker-template/worker.py \
+            --output-dir "out/${{ matrix.lane }}"
