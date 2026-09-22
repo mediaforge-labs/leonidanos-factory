@@ -1,0 +1,127 @@
+name: Leonidanos Factory - Finalize
+
+on:
+  workflow_dispatch:
+    inputs:
+      queue_id:
+        description: Optional queue id. Empty processes all eligible checkpoints.
+        required: false
+        default: ''
+  schedule:
+    - cron: '*/15 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: leonidanos-factory-finalize
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.FACTORY_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      SUPABASE_URL: https://rhddgfvtrkmusbvphnlg.supabase.co
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      YOUTUBE_PT_CLIENT_ID: ${{ secrets.YOUTUBE_PT_CLIENT_ID }}
+      YOUTUBE_PT_CLIENT_SECRET: ${{ secrets.YOUTUBE_PT_CLIENT_SECRET }}
+      YOUTUBE_PT_REFRESH_TOKEN: ${{ secrets.YOUTUBE_PT_REFRESH_TOKEN }}
+      YOUTUBE_PT_CHANNEL_ID: ${{ secrets.YOUTUBE_PT_CHANNEL_ID }}
+      YOUTUBE_EN_CLIENT_ID: ${{ secrets.YOUTUBE_EN_CLIENT_ID }}
+      YOUTUBE_EN_CLIENT_SECRET: ${{ secrets.YOUTUBE_EN_CLIENT_SECRET }}
+      YOUTUBE_EN_REFRESH_TOKEN: ${{ secrets.YOUTUBE_EN_REFRESH_TOKEN }}
+      YOUTUBE_EN_CHANNEL_ID: ${{ secrets.YOUTUBE_EN_CHANNEL_ID }}
+      QUEUE_SCOPE: ${{ github.event.inputs.queue_id || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            youtube-worker/upload_requirements.txt
+            youtube-worker/thumbnail_requirements.txt
+      - name: Install finalizer dependencies
+        run: |
+          set -euo pipefail
+          pip install --no-cache-dir -r youtube-worker/upload_requirements.txt
+          pip install --no-cache-dir -r youtube-worker/thumbnail_requirements.txt
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg librsvg2-bin fonts-montserrat fontconfig
+      - name: Preflight finalizer code
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            youtube-worker/mediaforge_upload_orchestrator.py \
+            youtube-worker/youtube_hosted_common.py \
+            youtube-worker/youtube_thumbnail_variant.py \
+            youtube-worker/youtube_private_uploader_hosted.py \
+            youtube-worker/youtube_shorts_uploader_hosted.py
+      - name: Render missing localized thumbnails
+        run: |
+          set -euo pipefail
+          python youtube-worker/mediaforge_upload_orchestrator.py --mode needs-thumbnail --queue-id "$QUEUE_SCOPE" > /tmp/items.json
+          python - <<'PY' > /tmp/items.tsv
+          import json
+          for row in json.load(open('/tmp/items.json')):
+              print(row['locale'] + '\t' + row['queue_id'])
+          PY
+          while IFS=$'\t' read -r locale queue_id; do
+            [ -n "$locale" ] || continue
+            LEONIDANOS_QUEUE_ID="$queue_id" LEONIDANOS_VARIANT_LOCALE="$locale" \
+              python youtube-worker/youtube_thumbnail_variant.py
+          done < /tmp/items.tsv
+      - name: Resume checkpointed long-form uploads
+        run: |
+          set -euo pipefail
+          python youtube-worker/mediaforge_upload_orchestrator.py --mode resume-failed --queue-id "$QUEUE_SCOPE" > /tmp/items.json
+          python - <<'PY' > /tmp/items.tsv
+          import json
+          for row in json.load(open('/tmp/items.json')):
+              print(row['locale'] + '\t' + row['queue_id'])
+          PY
+          while IFS=$'\t' read -r locale queue_id; do
+            [ -n "$locale" ] || continue
+            python youtube-worker/youtube_private_uploader_hosted.py --locale "$locale" --queue-id "$queue_id"
+          done < /tmp/items.tsv
+      - name: Retry eligible failed long-form uploads
+        run: |
+          set -euo pipefail
+          python youtube-worker/mediaforge_upload_orchestrator.py --mode retry-failed --queue-id "$QUEUE_SCOPE" > /tmp/items.json
+          python - <<'PY' > /tmp/items.tsv
+          import json
+          for row in json.load(open('/tmp/items.json')):
+              print(row['locale'] + '\t' + row['queue_id'])
+          PY
+          while IFS=$'\t' read -r locale queue_id; do
+            [ -n "$locale" ] || continue
+            python youtube-worker/youtube_private_uploader_hosted.py --locale "$locale" --queue-id "$queue_id"
+          done < /tmp/items.tsv
+      - name: Upload eligible long-form variants privately
+        run: |
+          set -euo pipefail
+          python youtube-worker/mediaforge_upload_orchestrator.py --mode ready --queue-id "$QUEUE_SCOPE" > /tmp/items.json
+          python - <<'PY' > /tmp/items.tsv
+          import json
+          for row in json.load(open('/tmp/items.json')):
+              print(row['locale'] + '\t' + row['queue_id'])
+          PY
+          while IFS=$'\t' read -r locale queue_id; do
+            [ -n "$locale" ] || continue
+            python youtube-worker/youtube_private_uploader_hosted.py --locale "$locale" --queue-id "$queue_id"
+          done < /tmp/items.tsv
+      - name: Upload exactly five verified Shorts privately
+        run: |
+          set -euo pipefail
+          python youtube-worker/mediaforge_upload_orchestrator.py --mode shorts-ready --queue-id "$QUEUE_SCOPE" > /tmp/items.json
+          python - <<'PY' > /tmp/items.tsv
+          import json
+          for row in json.load(open('/tmp/items.json')):
+              print(row['locale'] + '\t' + row['queue_id'])
+          PY
+          while IFS=$'\t' read -r locale queue_id; do
+            [ -n "$locale" ] || continue
+            python youtube-worker/youtube_shorts_uploader_hosted.py --locale "$locale" --queue-id "$queue_id"
+          done < /tmp/items.tsv
