@@ -8,7 +8,7 @@ import os
 import pathlib
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -16,6 +16,7 @@ from supabase_chunked import upload_direct_file, upload_file
 
 SUPABASE_BUCKET = "mediaforge-assets"
 RENDER_VERSION = "leonidanos-factory-v1"
+PREPARED_BY = "leonidanos-factory"
 CHUNK_THRESHOLD_BYTES = 45 * 1024 * 1024
 
 
@@ -56,14 +57,63 @@ def request_json(method: str, url: str, *, params=None, body=None, extra_headers
     return response.json() if response.content else None
 
 
+def utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def lease_job(locale: str, owner: str) -> dict | None:
-    payload = request_json(
-        "POST",
-        rest_url("rpc/lease_mediaforge_job"),
-        body={"p_locale": locale, "p_owner": owner, "p_lease_minutes": 180},
+    """Lease only jobs created by this clean repository, never legacy factory jobs."""
+    now = datetime.now(timezone.utc)
+    expires = (now + timedelta(minutes=180)).isoformat()
+    common = {
+        "select": "*",
+        "locale": f"eq.{locale}",
+        "preferred_backend": "eq.github",
+        "metadata->>prepared_by": f"eq.{PREPARED_BY}",
+        "order": "updated_at.asc",
+        "limit": "1",
+    }
+    candidates = request_json("GET", rest_url("youtube_factory_jobs"), params={**common, "status": "eq.pending"}) or []
+    expected_status = "pending"
+    extra_filter: dict[str, str] = {}
+    if not candidates:
+        candidates = request_json(
+            "GET",
+            rest_url("youtube_factory_jobs"),
+            params={**common, "status": "eq.running", "lease_expires_at": f"lt.{now.isoformat()}"},
+        ) or []
+        expected_status = "running"
+        extra_filter["lease_expires_at"] = f"lt.{now.isoformat()}"
+    if not candidates:
+        return None
+
+    candidate = candidates[0]
+    metadata = dict(candidate.get("metadata") or {})
+    if metadata.get("prepared_by") != PREPARED_BY:
+        raise RuntimeError("Safety block: attempted to lease a legacy factory job")
+    params = {
+        "id": f"eq.{candidate['id']}",
+        "status": f"eq.{expected_status}",
+        "metadata->>prepared_by": f"eq.{PREPARED_BY}",
+        **extra_filter,
+    }
+    body = {
+        "status": "running",
+        "selected_backend": "github",
+        "lease_owner": owner,
+        "lease_expires_at": expires,
+        "attempt": int(candidate.get("attempt") or 0) + 1,
+        "last_progress_at": utcnow(),
+        "updated_at": utcnow(),
+    }
+    claimed = request_json(
+        "PATCH",
+        rest_url("youtube_factory_jobs"),
+        params=params,
+        body=body,
         extra_headers={"Prefer": "return=representation"},
     ) or []
-    return payload[0] if payload else None
+    return claimed[0] if claimed else None
 
 
 def fetch_one(table: str, **filters) -> dict | None:
@@ -77,17 +127,10 @@ def fetch_one(table: str, **filters) -> dict | None:
 def patch_rows(table: str, body: dict, **filters) -> list[dict]:
     params = {key: f"eq.{value}" for key, value in filters.items()}
     rows = request_json(
-        "PATCH",
-        rest_url(table),
-        params=params,
-        body=body,
+        "PATCH", rest_url(table), params=params, body=body,
         extra_headers={"Prefer": "return=representation"},
     )
     return rows or []
-
-
-def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def build_job_manifest(job: dict, queue: dict, variant: dict, lane: str, locale: str) -> dict:
@@ -96,6 +139,8 @@ def build_job_manifest(job: dict, queue: dict, variant: dict, lane: str, locale:
     if len(script.split()) < 20:
         raise RuntimeError(f"Factory job has no usable TTS script for {locale}")
     metadata = dict(job.get("metadata") or {})
+    if metadata.get("prepared_by") != PREPARED_BY:
+        raise RuntimeError("Safety block: job was not prepared by leonidanos-factory")
     metadata.setdefault("music_enabled", False)
     metadata.setdefault("video_library_enabled", True)
     metadata.setdefault("video_library_max_assets", 18)
@@ -121,6 +166,8 @@ def build_job_manifest(job: dict, queue: dict, variant: dict, lane: str, locale:
 
 def durable_upload(local_path: pathlib.Path, storage_path: str, content_type: str | None = None) -> str:
     local_path = pathlib.Path(local_path)
+    if not local_path.is_file() or local_path.stat().st_size <= 0:
+        raise RuntimeError(f"Output file missing: {local_path}")
     content_type = content_type or mimetypes.guess_type(local_path.name)[0] or "application/octet-stream"
     if local_path.stat().st_size >= CHUNK_THRESHOLD_BYTES:
         return upload_file(local_path, bucket=SUPABASE_BUCKET, storage_path=storage_path, content_type=content_type)
@@ -134,20 +181,15 @@ def mark_failed(job: dict | None, variant: dict | None, owner: str, error: str) 
         metadata["last_error"] = message
         metadata["failed_at"] = utcnow()
         try:
-            patch_rows(
-                "youtube_factory_jobs",
-                {
-                    "status": "failed",
-                    "fallback_reason": message,
-                    "last_progress_at": utcnow(),
-                    "completed_at": utcnow(),
-                    "lease_expires_at": None,
-                    "lease_owner": None,
-                    "metadata": metadata,
-                    "updated_at": utcnow(),
-                },
-                id=job["id"],
-            )
+            patch_rows("youtube_factory_jobs", {
+                "status": "failed", "fallback_reason": message, "last_progress_at": utcnow(),
+                "completed_at": utcnow(), "lease_expires_at": None, "lease_owner": None,
+                "metadata": metadata, "updated_at": utcnow(),
+            }, id=job["id"])
+        except Exception:
+            pass
+        try:
+            patch_rows("youtube_queue", {"status": "failed", "last_error": message, "updated_at": utcnow()}, id=job["queue_id"])
         except Exception:
             pass
     if variant:
@@ -181,7 +223,6 @@ def run_factory(args: argparse.Namespace) -> int:
         if not job:
             print(json.dumps({"status": "idle", "lane": args.lane, "locale": args.locale}))
             return 0
-
         queue = fetch_one("youtube_queue", id=job["queue_id"])
         if not queue:
             raise RuntimeError(f"Queue row not found: {job['queue_id']}")
@@ -205,27 +246,19 @@ def run_factory(args: argparse.Namespace) -> int:
         env["MEDIAFORGE_TTS_PROVIDER"] = "chatterbox"
         env["SUPABASE_SECRET_KEY"] = service_key()
         subprocess.run([
-            sys.executable, args.worker,
-            "--bundle", args.bundle,
-            "--job", str(job_path),
-            "--lane", args.lane,
-            "--locale", args.locale,
-            "--output-dir", args.output_dir,
+            sys.executable, args.worker, "--bundle", args.bundle, "--job", str(job_path),
+            "--lane", args.lane, "--locale", args.locale, "--output-dir", args.output_dir,
         ], check=True, env=env)
 
         out = pathlib.Path(args.output_dir)
         manifest, video_path, audio_path = validate_outputs(out)
         run_key = os.environ.get("GITHUB_RUN_ID", datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"))
         prefix = f"renders/{job['queue_id']}/{args.locale}/{run_key}"
-
         video_uri = durable_upload(video_path, f"{prefix}/long-form.mp4", "video/mp4")
         audio_uri = durable_upload(audio_path, f"{prefix}/narration.wav", "audio/wav")
         manifest_uri = durable_upload(out / "manifest.json", f"{prefix}/manifest.json", "application/json")
         durable_upload(out / "captions" / "long-form.srt", f"{prefix}/long-form.srt", "application/x-subrip")
-        short_uris = []
-        for short in sorted((out / "shorts").glob("short-*.mp4")):
-            short_uris.append(durable_upload(short, f"{prefix}/shorts/{short.name}", "video/mp4"))
-
+        short_uris = [durable_upload(short, f"{prefix}/shorts/{short.name}", "video/mp4") for short in sorted((out / "shorts").glob("short-*.mp4"))]
         expected_shorts = int((job.get("metadata") or {}).get("shorts_requested") or 5)
         if len(short_uris) != expected_shorts:
             raise RuntimeError(f"Expected {expected_shorts} Shorts but render produced {len(short_uris)}")
@@ -235,44 +268,23 @@ def run_factory(args: argparse.Namespace) -> int:
         if current in {"uploaded", "uploading"}:
             next_status = current
         duration = float((manifest.get("metrics") or {}).get("narration_seconds") or 0)
-        patch_rows(
-            "youtube_video_variants",
-            {
-                "status": next_status,
-                "audio_url": audio_uri,
-                "video_url": video_uri,
-                "video_duration_seconds": duration,
-                "render_version": RENDER_VERSION,
-                "last_error": None,
-                "updated_at": utcnow(),
-            },
-            id=variant["id"],
-        )
+        patch_rows("youtube_video_variants", {
+            "status": next_status, "audio_url": audio_uri, "video_url": video_uri,
+            "video_duration_seconds": duration, "render_version": RENDER_VERSION,
+            "last_error": None, "updated_at": utcnow(),
+        }, id=variant["id"])
         if args.locale == "pt-BR":
             patch_rows("youtube_queue", {"audio_url": audio_uri, "video_url": video_uri, "last_error": None, "updated_at": utcnow()}, id=job["queue_id"])
 
         metadata = dict(job.get("metadata") or {})
         metadata["result"] = {
-            "video_url": video_uri,
-            "audio_url": audio_uri,
-            "manifest_url": manifest_uri,
-            "shorts": short_uris,
-            "render_version": RENDER_VERSION,
-            "metrics": manifest.get("metrics") or {},
+            "video_url": video_uri, "audio_url": audio_uri, "manifest_url": manifest_uri,
+            "shorts": short_uris, "render_version": RENDER_VERSION, "metrics": manifest.get("metrics") or {},
         }
-        patch_rows(
-            "youtube_factory_jobs",
-            {
-                "status": "completed",
-                "last_progress_at": utcnow(),
-                "completed_at": utcnow(),
-                "lease_expires_at": None,
-                "lease_owner": None,
-                "metadata": metadata,
-                "updated_at": utcnow(),
-            },
-            id=job["id"],
-        )
+        patch_rows("youtube_factory_jobs", {
+            "status": "completed", "last_progress_at": utcnow(), "completed_at": utcnow(),
+            "lease_expires_at": None, "lease_owner": None, "metadata": metadata, "updated_at": utcnow(),
+        }, id=job["id"])
         print(json.dumps({"status": "completed", "job_id": job["id"], "lane": args.lane, "video_url": video_uri}))
         return 0
     except Exception as exc:
