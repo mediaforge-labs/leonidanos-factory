@@ -1,0 +1,115 @@
+name: One-time Leonidanos Supabase cutover transform
+
+on:
+  push:
+    branches:
+      - migration/supabase-cutover-20260928
+    paths:
+      - '.github/workflows/cutover-transform.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  transform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply deterministic cutover changes
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          old_url = 'https://rhddgfvtrkmusbvphnlg.supabase.co'
+          new_url = 'https://cwxadcrtnbciziexbili.supabase.co'
+          for name in ['.github/workflows/prepare.yml', '.github/workflows/factory.yml', '.github/workflows/finalize.yml']:
+              p = Path(name)
+              text = p.read_text()
+              text = text.replace(old_url, new_url)
+              p.write_text(text)
+
+          p = Path('.github/workflows/finalize.yml')
+          text = p.read_text()
+          needle = '      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}\n'
+          replacement = '      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}\n' + needle
+          if 'SUPABASE_SECRET_KEY:' not in text:
+              text = text.replace(needle, replacement, 1)
+          p.write_text(text)
+
+          p = Path('.github/workflows/factory.yml')
+          text = p.read_text()
+          text = text.replace(
+              "          ! grep -R -E 'dell_asset|LEONIDANOS_MEDIA_ROOT|self-hosted|gateway|tunnel' public-worker-template .github/workflows/factory.yml\n",
+              "          ! grep -R -E 'dell_asset|LEONIDANOS_MEDIA_ROOT|self-hosted|gateway|tunnel|media-pipeline-engine' public-worker-template .github/workflows/factory.yml\n          test -s encrypted-core/v7/part-01a.b64\n          test -s encrypted-core/v7/part-01b.b64\n          test -s encrypted-core/v7/part-02.b64\n          test -s encrypted-core/v7/part-03.b64\n          test -s encrypted-core/v7/part-04.b64\n          test \"$(cat encrypted-core/v7/part-01a.b64 encrypted-core/v7/part-01b.b64 encrypted-core/v7/part-02.b64 encrypted-core/v7/part-03.b64 encrypted-core/v7/part-04.b64 | tr -d '\\\\r\\\\n\\\\t ' | base64 --decode | wc -c)\" -eq 21279\n"
+          )
+          old_block = """          mkdir -p .runtime/core-parts
+          CORE_BASE='https://raw.githubusercontent.com/mediaforge-labs/media-pipeline-engine/main/encrypted-core/v7'
+          for part in part-01a.b64 part-01b.b64 part-02.b64 part-03.b64 part-04.b64; do
+            curl --fail --silent --show-error --location \"$CORE_BASE/$part\" -o \".runtime/core-parts/$part\"
+            test -s \".runtime/core-parts/$part\"
+          done
+"""
+          new_block = """          mkdir -p .runtime/core-parts
+          CORE_BASE='encrypted-core/v7'
+          for part in part-01a.b64 part-01b.b64 part-02.b64 part-03.b64 part-04.b64; do
+            test -s \"$CORE_BASE/$part\"
+            cp \"$CORE_BASE/$part\" \".runtime/core-parts/$part\"
+          done
+"""
+          if old_block not in text:
+              raise SystemExit('expected legacy core block was not found')
+          text = text.replace(old_block, new_block, 1)
+          p.write_text(text)
+
+          replacements = {
+              'youtube-worker/mediaforge_prepare_jobs.py': (
+                  'SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()',
+                  'SUPABASE_SERVICE_ROLE_KEY = (os.getenv("SUPABASE_SECRET_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()',
+              ),
+              'youtube-worker/youtube_hosted_common.py': (
+                  '(os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SECRET_KEY") or "").strip()',
+                  '(os.environ.get("SUPABASE_SECRET_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()',
+              ),
+              'youtube-worker/mediaforge_upload_orchestrator.py': (
+                  '(os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SECRET_KEY") or "").strip()',
+                  '(os.environ.get("SUPABASE_SECRET_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()',
+              ),
+              'youtube-worker/youtube_thumbnail_variant.py': (
+                  '(os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SECRET_KEY") or "").strip()',
+                  '(os.getenv("SUPABASE_SECRET_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()',
+              ),
+          }
+          for name, (old, new) in replacements.items():
+              p = Path(name)
+              text = p.read_text()
+              if old not in text:
+                  raise SystemExit(f'expected Supabase key expression missing: {name}')
+              p.write_text(text.replace(old, new, 1))
+          PY
+      - name: Validate transformed files
+        run: |
+          set -euo pipefail
+          ! grep -R 'rhddgfvtrkmusbvphnlg' .github/workflows youtube-worker public-worker-template
+          ! grep -R 'media-pipeline-engine' .github/workflows/factory.yml
+          grep -q 'cwxadcrtnbciziexbili.supabase.co' .github/workflows/prepare.yml
+          grep -q 'cwxadcrtnbciziexbili.supabase.co' .github/workflows/factory.yml
+          grep -q 'cwxadcrtnbciziexbili.supabase.co' .github/workflows/finalize.yml
+          python -m py_compile \
+            youtube-worker/mediaforge_prepare_jobs.py \
+            youtube-worker/youtube_hosted_common.py \
+            youtube-worker/mediaforge_upload_orchestrator.py \
+            youtube-worker/youtube_thumbnail_variant.py \
+            public-worker-template/factory_worker.py \
+            public-worker-template/supabase_chunked.py
+      - name: Commit cutover changes
+        run: |
+          set -euo pipefail
+          git config user.name 'mediaforge-labs'
+          git config user.email 'leonidanosportal@gmail.com'
+          git add .github/workflows/prepare.yml .github/workflows/factory.yml .github/workflows/finalize.yml youtube-worker/mediaforge_prepare_jobs.py youtube-worker/youtube_hosted_common.py youtube-worker/mediaforge_upload_orchestrator.py youtube-worker/youtube_thumbnail_variant.py
+          git commit -m 'Cut Leonidanos Factory over to migrated Supabase'
+          git push origin HEAD:migration/supabase-cutover-20260928
