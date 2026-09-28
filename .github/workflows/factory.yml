@@ -53,6 +53,55 @@ jobs:
           test "$(stat -c%s /tmp/core.bundle.enc)" -eq 21279
           echo 'Static clean-factory validation passed; music is disabled and production core is local.'
 
+  cutover-check:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SUPABASE_KEY: ${{ secrets.SUPABASE_SECRET_KEY || secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      HAS_ANTHROPIC: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+      HAS_CORE_KEY: ${{ secrets.MEDIAFORGE_CORE_KEY_B64 != '' }}
+      HAS_VOICE_REFERENCE: ${{ secrets.MEDIAFORGE_VOICE_REFERENCE_B64 != '' }}
+      HAS_YOUTUBE_PT_CLIENT_ID: ${{ secrets.YOUTUBE_PT_CLIENT_ID != '' }}
+      HAS_YOUTUBE_PT_CLIENT_SECRET: ${{ secrets.YOUTUBE_PT_CLIENT_SECRET != '' }}
+      HAS_YOUTUBE_PT_REFRESH_TOKEN: ${{ secrets.YOUTUBE_PT_REFRESH_TOKEN != '' }}
+      HAS_YOUTUBE_PT_CHANNEL_ID: ${{ secrets.YOUTUBE_PT_CHANNEL_ID != '' }}
+      HAS_YOUTUBE_EN_CLIENT_ID: ${{ secrets.YOUTUBE_EN_CLIENT_ID != '' }}
+      HAS_YOUTUBE_EN_CLIENT_SECRET: ${{ secrets.YOUTUBE_EN_CLIENT_SECRET != '' }}
+      HAS_YOUTUBE_EN_REFRESH_TOKEN: ${{ secrets.YOUTUBE_EN_REFRESH_TOKEN != '' }}
+      HAS_YOUTUBE_EN_CHANNEL_ID: ${{ secrets.YOUTUBE_EN_CHANNEL_ID != '' }}
+    steps:
+      - name: Verify cutover secrets and migrated Supabase access
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "$SUPABASE_KEY" ] || missing+=(SUPABASE_SECRET_KEY_or_SUPABASE_SERVICE_ROLE_KEY)
+          [ "$HAS_ANTHROPIC" = 'true' ] || missing+=(ANTHROPIC_API_KEY)
+          [ "$HAS_CORE_KEY" = 'true' ] || missing+=(MEDIAFORGE_CORE_KEY_B64)
+          [ "$HAS_VOICE_REFERENCE" = 'true' ] || missing+=(MEDIAFORGE_VOICE_REFERENCE_B64)
+          [ "$HAS_YOUTUBE_PT_CLIENT_ID" = 'true' ] || missing+=(YOUTUBE_PT_CLIENT_ID)
+          [ "$HAS_YOUTUBE_PT_CLIENT_SECRET" = 'true' ] || missing+=(YOUTUBE_PT_CLIENT_SECRET)
+          [ "$HAS_YOUTUBE_PT_REFRESH_TOKEN" = 'true' ] || missing+=(YOUTUBE_PT_REFRESH_TOKEN)
+          [ "$HAS_YOUTUBE_PT_CHANNEL_ID" = 'true' ] || missing+=(YOUTUBE_PT_CHANNEL_ID)
+          [ "$HAS_YOUTUBE_EN_CLIENT_ID" = 'true' ] || missing+=(YOUTUBE_EN_CLIENT_ID)
+          [ "$HAS_YOUTUBE_EN_CLIENT_SECRET" = 'true' ] || missing+=(YOUTUBE_EN_CLIENT_SECRET)
+          [ "$HAS_YOUTUBE_EN_REFRESH_TOKEN" = 'true' ] || missing+=(YOUTUBE_EN_REFRESH_TOKEN)
+          [ "$HAS_YOUTUBE_EN_CHANNEL_ID" = 'true' ] || missing+=(YOUTUBE_EN_CHANNEL_ID)
+          if [ ${#missing[@]} -gt 0 ]; then
+            printf 'Missing cutover secret: %s\n' "${missing[@]}"
+            exit 1
+          fi
+          auth=(-H "apikey: $SUPABASE_KEY")
+          if [[ "$SUPABASE_KEY" != sb_secret_* ]]; then
+            auth+=(-H "Authorization: Bearer $SUPABASE_KEY")
+          fi
+          curl --fail --silent --show-error --get \
+            "$SUPABASE_URL/rest/v1/youtube_factory_jobs" "${auth[@]}" \
+            --data-urlencode 'select=id' \
+            --data-urlencode 'limit=1' > /tmp/supabase-preflight.json
+          python -m json.tool /tmp/supabase-preflight.json >/dev/null
+          echo 'Cutover secrets are present and migrated Supabase access is valid.'
+
   probe:
     if: ${{ github.event_name != 'push' && (github.event_name != 'schedule' || vars.FACTORY_ENABLED == 'true') }}
     runs-on: ubuntu-latest
