@@ -23,8 +23,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
-      SUPABASE_URL: https://rhddgfvtrkmusbvphnlg.supabase.co
-      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_URL: https://cwxadcrtnbciziexbili.supabase.co
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY || secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SECRET_KEY || secrets.SUPABASE_SERVICE_ROLE_KEY }}
       YOUTUBE_PT_CLIENT_ID: ${{ secrets.YOUTUBE_PT_CLIENT_ID }}
       YOUTUBE_PT_CLIENT_SECRET: ${{ secrets.YOUTUBE_PT_CLIENT_SECRET }}
       YOUTUBE_PT_REFRESH_TOKEN: ${{ secrets.YOUTUBE_PT_REFRESH_TOKEN }}
