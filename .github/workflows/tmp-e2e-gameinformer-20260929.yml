@@ -12,6 +12,7 @@ env:
   SUPABASE_URL: https://cwxadcrtnbciziexbili.supabase.co
   QUEUE_ID: f6215ff7-f7a7-458d-8ba5-d01bdbf0bb34
   MEDIAFORGE_MUSIC_ENABLED: '0'
+  E2E_REVISION: live-health-authoritative-v2
 
 jobs:
   prepare:
