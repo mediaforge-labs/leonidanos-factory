@@ -1,0 +1,54 @@
+name: TMP Dell Live Health Smoke
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tmp-dell-live-health-smoke.yml'
+
+permissions:
+  contents: read
+
+env:
+  SUPABASE_URL: https://cwxadcrtnbciziexbili.supabase.co
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY || secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - name: Probe control status and live health without exposing endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, urllib.request
+
+          base = os.environ['SUPABASE_URL'].rstrip('/')
+          key = os.environ['SUPABASE_SECRET_KEY']
+          req = urllib.request.Request(
+              base + '/functions/v1/mediaforge-dell-control?action=status',
+              headers={'apikey': key, 'Authorization': 'Bearer ' + key, 'User-Agent': 'Leonidanos-Dell-Smoke/1.0'},
+          )
+          with urllib.request.urlopen(req, timeout=30) as r:
+              status = json.load(r)
+          public_url = str(status.get('public_url') or '').rstrip('/')
+          if not public_url:
+              raise SystemExit('control status has no public_url')
+          health_req = urllib.request.Request(public_url + '/health', headers={'User-Agent': 'Leonidanos-Dell-Smoke/1.0'})
+          with urllib.request.urlopen(health_req, timeout=20) as r:
+              health = json.load(r)
+          safe = {
+              'status': status.get('status'),
+              'heartbeat_at': status.get('heartbeat_at'),
+              'health_ok': health.get('ok'),
+              'version': health.get('version'),
+              'catalog_assets': health.get('catalog_assets'),
+          }
+          print(json.dumps(safe, ensure_ascii=False))
+          if health.get('ok') is not True:
+              raise SystemExit('live health did not return ok=true')
+          if str(health.get('version') or '') != '3.2-active-gta-vi-rest':
+              raise SystemExit('live gateway version is not v3.2')
+          PY
