@@ -3,14 +3,14 @@ from __future__ import annotations
 
 """Resilient contract gate for Dell asset gateway v3.2.
 
-V7 keeps the strict v6 repository contract, but tolerates the brief control-plane race
-that occurs when a Cloudflare Quick Tunnel is renewed and receives a new public URL.
+V7 keeps the strict v6 repository contract and tolerates control-plane drift. The
+live gateway /health endpoint is authoritative for liveness; the stored heartbeat is
+only a hint that can legitimately be stale while a persistent tunnel keeps serving.
 """
 
 import importlib.util
 import pathlib
 import time
-from datetime import datetime, timezone
 
 HERE = pathlib.Path(__file__).resolve().parent
 V6 = HERE / "dell_asset_client_v6.py"
@@ -24,35 +24,22 @@ spec.loader.exec_module(v6)
 _original_fetch_live_health = v6.fetch_live_health
 
 
-def _heartbeat_fresh(status: dict, max_age_seconds: int = 120) -> bool:
-    raw = str(status.get("heartbeat_at") or "")
-    try:
-        beat = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        return (datetime.now(timezone.utc) - beat).total_seconds() <= max_age_seconds
-    except Exception:
-        return False
-
-
 def resilient_fetch_live_health(status: dict) -> dict:
     current = dict(status)
     last_error = "unknown"
 
-    # Six passes cover tunnel rotation + the 20s Dell heartbeat interval without
-    # hiding a genuinely offline workstation for several minutes.
+    # Always probe the currently published public_url first, even when the control
+    # heartbeat is stale. v6 already validates that /health returns ok=true and that
+    # the live gateway is the expected v3.2 implementation. If the endpoint is really
+    # gone (for example after a Quick Tunnel rotation), refresh control state and retry.
     for attempt in range(1, 7):
-        if _heartbeat_fresh(current):
-            try:
-                health = _original_fetch_live_health(current)
-                status.clear()
-                status.update(current)
-                return health
-            except SystemExit as exc:
-                last_error = str(exc)
-        else:
-            last_error = (
-                "Dell control heartbeat is stale; waiting for the workstation gateway "
-                "to publish a fresh endpoint"
-            )
+        try:
+            health = _original_fetch_live_health(current)
+            status.clear()
+            status.update(current)
+            return health
+        except SystemExit as exc:
+            last_error = str(exc)
 
         if attempt == 6:
             break
@@ -69,8 +56,8 @@ def resilient_fetch_live_health(status: dict) -> dict:
 
     raise SystemExit(
         "Dell asset gateway did not become healthy after automatic endpoint recovery. "
-        f"Last state: {last_error}. Ensure the Dell is powered on/logged in and run "
-        "tools/setup_dell_asset_gateway_v32.ps1 once if the gateway was upgraded."
+        f"Last state: {last_error}. Ensure the Dell gateway/tunnel is reachable and, "
+        "if its endpoint changed, republish the current status from the workstation."
     )
 
 
