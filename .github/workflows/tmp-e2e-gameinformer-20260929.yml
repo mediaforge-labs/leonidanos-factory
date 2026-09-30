@@ -145,11 +145,7 @@ jobs:
           set -euo pipefail
           for mode in resume-failed retry-failed ready; do
             python youtube-worker/mediaforge_upload_orchestrator.py --mode "$mode" --queue-id "$QUEUE_ID" > /tmp/items.json
-            python - <<'PY' > /tmp/items.tsv
-import json
-for row in json.load(open('/tmp/items.json')):
-    print(row['locale'] + '\t' + row['queue_id'])
-PY
+            jq -r '.[] | [.locale,.queue_id] | @tsv' /tmp/items.json > /tmp/items.tsv
             while IFS=$'\t' read -r locale queue_id; do
               [ -n "$locale" ] || continue
               python youtube-worker/youtube_private_uploader_hosted.py --locale "$locale" --queue-id "$queue_id"
