@@ -71,6 +71,8 @@ jobs:
       MEDIAFORGE_TTS_MAX_WORKERS: '1'
       MEDIAFORGE_TTS_STRICT_CHUNK_ORDER: '1'
       MEDIAFORGE_STRICT_UNIQUE_MEDIA: '1'
+      MEDIAFORGE_ACTIVE_GTA_VI_BASELINE: '126'
+      MEDIAFORGE_DEBUG_SUBPROCESS_STDERR: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -80,8 +82,21 @@ jobs:
           cache-dependency-path: |
             public-worker-template/requirements.txt
             public-worker-template/requirements-production.txt
+      - name: Preflight production code
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            public-worker-template/factory_worker.py \
+            public-worker-template/factory_worker_media.py \
+            public-worker-template/dell_asset_client.py \
+            public-worker-template/dell_asset_client_v5.py \
+            public-worker-template/dell_asset_client_v6.py \
+            public-worker-template/dell_asset_client_v7.py \
+            public-worker-template/worker.py \
+            public-worker-template/validate_render.py
       - name: Install production dependencies
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip setuptools wheel
           pip install --index-url https://download.pytorch.org/whl/cpu torch==2.6.0 torchaudio==2.6.0
           pip install -r public-worker-template/requirements.txt
@@ -103,11 +118,20 @@ jobs:
           set -euo pipefail
           printf '%s' "$VOICE_REFERENCE_B64" | base64 --decode > .runtime/voice-reference.ogg
           ffmpeg -y -loglevel error -i .runtime/voice-reference.ogg -vn -ac 1 -ar 24000 -c:a pcm_s16le .runtime/voice-reference.wav
+          test -s .runtime/voice-reference.wav
           echo "MEDIAFORGE_VOICE_REFERENCE_PATH=$(realpath .runtime/voice-reference.wav)" >> "$GITHUB_ENV"
-      - name: Render factory job
+      - name: Render factory job with media preflight
         run: |
+          set -euo pipefail
           export MEDIAFORGE_MUSIC_ENABLED=0
-          python public-worker-template/factory_worker.py --lane "${{ matrix.lane }}" --locale "${{ matrix.locale }}" --bundle "$MEDIAFORGE_BUNDLE_PATH" --worker public-worker-template/worker.py --output-dir "out/${{ matrix.lane }}"
+          python public-worker-template/factory_worker_media.py \
+            --lane "${{ matrix.lane }}" \
+            --locale "${{ matrix.locale }}" \
+            --bundle "$MEDIAFORGE_BUNDLE_PATH" \
+            --worker public-worker-template/worker.py \
+            --asset-client public-worker-template/dell_asset_client_v7.py \
+            --validator public-worker-template/validate_render.py \
+            --output-dir "out/${{ matrix.lane }}"
 
   finalize:
     needs: render
