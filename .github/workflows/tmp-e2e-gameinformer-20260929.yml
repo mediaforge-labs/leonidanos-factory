@@ -26,8 +26,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: pip
-          cache-dependency-path: youtube-worker/editorial_requirements.txt
       - run: pip install --no-cache-dir -r youtube-worker/editorial_requirements.txt
       - name: Prepare clean PT and EN jobs
         run: python youtube-worker/mediaforge_prepare_jobs.py --queue-id "$QUEUE_ID"
@@ -131,10 +129,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: pip
-          cache-dependency-path: |
-            youtube-worker/upload_requirements.txt
-            youtube-worker/thumbnail_requirements.txt
       - run: |
           pip install --no-cache-dir -r youtube-worker/upload_requirements.txt
           pip install --no-cache-dir -r youtube-worker/thumbnail_requirements.txt
