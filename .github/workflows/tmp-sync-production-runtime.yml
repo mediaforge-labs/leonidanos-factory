@@ -1,0 +1,60 @@
+name: TMP Sync MediaForge Production Runtime
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-sync-production-runtime.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync proven runtime files from public production repository
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/media-pipeline-engine
+          git clone --depth 1 https://github.com/mediaforge-labs/media-pipeline-engine.git /tmp/media-pipeline-engine
+
+          for file in \
+            dell_asset_client.py \
+            dell_asset_client_v5.py \
+            dell_asset_client_v6.py \
+            dell_asset_client_v7.py \
+            validate_render.py \
+            worker.py \
+            worker_v2.py \
+            requirements-production.txt
+          do
+            cp "/tmp/media-pipeline-engine/public-worker-template/$file" "public-worker-template/$file"
+          done
+
+          python -m py_compile \
+            public-worker-template/dell_asset_client.py \
+            public-worker-template/dell_asset_client_v5.py \
+            public-worker-template/dell_asset_client_v6.py \
+            public-worker-template/dell_asset_client_v7.py \
+            public-worker-template/validate_render.py \
+            public-worker-template/worker.py \
+            public-worker-template/worker_v2.py
+
+      - name: Commit synchronized runtime
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add public-worker-template
+          if git diff --cached --quiet; then
+            echo 'Runtime already synchronized.'
+            exit 0
+          fi
+          git commit -m 'fix: restore proven MediaForge v7 runtime support'
+          git push origin HEAD:main
