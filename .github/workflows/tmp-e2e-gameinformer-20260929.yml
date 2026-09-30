@@ -1,0 +1,157 @@
+name: TMP E2E Game Informer 2026-09-29
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tmp-e2e-gameinformer-20260929.yml'
+
+permissions:
+  contents: read
+
+env:
+  SUPABASE_URL: https://cwxadcrtnbciziexbili.supabase.co
+  QUEUE_ID: f6215ff7-f7a7-458d-8ba5-d01bdbf0bb34
+  MEDIAFORGE_MUSIC_ENABLED: '0'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY || secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SECRET_KEY || secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: youtube-worker/editorial_requirements.txt
+      - run: pip install --no-cache-dir -r youtube-worker/editorial_requirements.txt
+      - name: Prepare clean PT and EN jobs
+        run: python youtube-worker/mediaforge_prepare_jobs.py --queue-id "$QUEUE_ID"
+
+  thumbnails:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY || secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SECRET_KEY || secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install --no-cache-dir -r youtube-worker/thumbnail_requirements.txt
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg librsvg2-bin fonts-montserrat fontconfig
+      - name: Render PT thumbnail
+        run: LEONIDANOS_QUEUE_ID="$QUEUE_ID" LEONIDANOS_VARIANT_LOCALE=pt-BR python youtube-worker/youtube_thumbnail_variant.py
+      - name: Render EN thumbnail
+        run: LEONIDANOS_QUEUE_ID="$QUEUE_ID" LEONIDANOS_VARIANT_LOCALE=en-US python youtube-worker/youtube_thumbnail_variant.py
+
+  render:
+    needs: thumbnails
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: pt-e2e
+            locale: pt-BR
+          - lane: en-e2e
+            locale: en-US
+    env:
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY || secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SECRET_KEY || secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      MEDIAFORGE_CORE_KEY_B64: ${{ secrets.MEDIAFORGE_CORE_KEY_B64 }}
+      MEDIAFORGE_TTS_PROVIDER: chatterbox
+      MEDIAFORGE_TTS_MAX_WORKERS: '1'
+      MEDIAFORGE_TTS_STRICT_CHUNK_ORDER: '1'
+      MEDIAFORGE_STRICT_UNIQUE_MEDIA: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            public-worker-template/requirements.txt
+            public-worker-template/requirements-production.txt
+      - name: Install production dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.6.0 torchaudio==2.6.0
+          pip install -r public-worker-template/requirements.txt
+          pip install -r public-worker-template/requirements-production.txt
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Materialize production core
+        run: |
+          set -euo pipefail
+          mkdir -p .runtime/core-parts
+          for part in part-01a.b64 part-01b.b64 part-02.b64 part-03.b64 part-04.b64; do cp "encrypted-core/v7/$part" ".runtime/core-parts/$part"; done
+          cat .runtime/core-parts/part-01a.b64 .runtime/core-parts/part-01b.b64 .runtime/core-parts/part-02.b64 .runtime/core-parts/part-03.b64 .runtime/core-parts/part-04.b64 | tr -d '\r\n\t ' | base64 --decode > .runtime/core.bundle.enc
+          test "$(stat -c%s .runtime/core.bundle.enc)" -eq 21279
+          echo "MEDIAFORGE_BUNDLE_PATH=$(realpath .runtime/core.bundle.enc)" >> "$GITHUB_ENV"
+      - name: Materialize human voice reference
+        env:
+          VOICE_REFERENCE_B64: ${{ secrets.MEDIAFORGE_VOICE_REFERENCE_B64 }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$VOICE_REFERENCE_B64" | base64 --decode > .runtime/voice-reference.ogg
+          ffmpeg -y -loglevel error -i .runtime/voice-reference.ogg -vn -ac 1 -ar 24000 -c:a pcm_s16le .runtime/voice-reference.wav
+          echo "MEDIAFORGE_VOICE_REFERENCE_PATH=$(realpath .runtime/voice-reference.wav)" >> "$GITHUB_ENV"
+      - name: Render factory job
+        run: |
+          export MEDIAFORGE_MUSIC_ENABLED=0
+          python public-worker-template/factory_worker.py --lane "${{ matrix.lane }}" --locale "${{ matrix.locale }}" --bundle "$MEDIAFORGE_BUNDLE_PATH" --worker public-worker-template/worker.py --output-dir "out/${{ matrix.lane }}"
+
+  finalize:
+    needs: render
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY || secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SECRET_KEY || secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      YOUTUBE_PT_CLIENT_ID: ${{ secrets.YOUTUBE_PT_CLIENT_ID }}
+      YOUTUBE_PT_CLIENT_SECRET: ${{ secrets.YOUTUBE_PT_CLIENT_SECRET }}
+      YOUTUBE_PT_REFRESH_TOKEN: ${{ secrets.YOUTUBE_PT_REFRESH_TOKEN }}
+      YOUTUBE_PT_CHANNEL_ID: ${{ secrets.YOUTUBE_PT_CHANNEL_ID }}
+      YOUTUBE_EN_CLIENT_ID: ${{ secrets.YOUTUBE_EN_CLIENT_ID }}
+      YOUTUBE_EN_CLIENT_SECRET: ${{ secrets.YOUTUBE_EN_CLIENT_SECRET }}
+      YOUTUBE_EN_REFRESH_TOKEN: ${{ secrets.YOUTUBE_EN_REFRESH_TOKEN }}
+      YOUTUBE_EN_CHANNEL_ID: ${{ secrets.YOUTUBE_EN_CHANNEL_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            youtube-worker/upload_requirements.txt
+            youtube-worker/thumbnail_requirements.txt
+      - run: |
+          pip install --no-cache-dir -r youtube-worker/upload_requirements.txt
+          pip install --no-cache-dir -r youtube-worker/thumbnail_requirements.txt
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg librsvg2-bin fonts-montserrat fontconfig
+      - name: Upload long-form variants privately
+        run: |
+          set -euo pipefail
+          for mode in resume-failed retry-failed ready; do
+            python youtube-worker/mediaforge_upload_orchestrator.py --mode "$mode" --queue-id "$QUEUE_ID" > /tmp/items.json
+            python - <<'PY' > /tmp/items.tsv
+import json
+for row in json.load(open('/tmp/items.json')):
+    print(row['locale'] + '\t' + row['queue_id'])
+PY
+            while IFS=$'\t' read -r locale queue_id; do
+              [ -n "$locale" ] || continue
+              python youtube-worker/youtube_private_uploader_hosted.py --locale "$locale" --queue-id "$queue_id"
+            done < /tmp/items.tsv
+          done
