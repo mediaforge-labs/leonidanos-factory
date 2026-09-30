@@ -32,15 +32,26 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Validate clean factory code
+      - name: Validate production factory code
         run: |
           set -euo pipefail
           python -m py_compile \
             public-worker-template/worker.py \
             public-worker-template/supabase_chunked.py \
-            public-worker-template/factory_worker.py
-          grep -q 'music_enabled", False' public-worker-template/factory_worker.py
-          ! grep -R -E 'dell_asset|LEONIDANOS_MEDIA_ROOT|self-hosted|gateway|tunnel|media-pipeline-engine' public-worker-template .github/workflows/factory.yml
+            public-worker-template/factory_worker.py \
+            public-worker-template/factory_worker_media.py \
+            public-worker-template/dell_asset_client.py \
+            public-worker-template/dell_asset_client_v5.py \
+            public-worker-template/dell_asset_client_v6.py \
+            public-worker-template/dell_asset_client_v7.py \
+            public-worker-template/validate_render.py
+          grep -q 'music_enabled.*False' public-worker-template/factory_worker_media.py
+          grep -q 'dell_asset_client_v7.py' public-worker-template/factory_worker_media.py
+          grep -q 'MEDIAFORGE_VIDEO_LIBRARY_ROOT' public-worker-template/factory_worker_media.py
+          ! grep -R -E 'self-hosted|media-pipeline-engine' \
+            .github/workflows/factory.yml \
+            public-worker-template/factory_worker.py \
+            public-worker-template/factory_worker_media.py
           for part in part-01a.b64 part-01b.b64 part-02.b64 part-03.b64 part-04.b64; do
             test -s "encrypted-core/v7/$part"
           done
@@ -51,7 +62,7 @@ jobs:
               encrypted-core/v7/part-04.b64 \
             | tr -d '\r\n\t ' | base64 --decode > /tmp/core.bundle.enc
           test "$(stat -c%s /tmp/core.bundle.enc)" -eq 21279
-          echo 'Static clean-factory validation passed; music is disabled and production core is local.'
+          echo 'Static production-factory validation passed: GitHub renders, Dell only supplies curated media, music disabled.'
 
   cutover-check:
     if: ${{ github.event_name == 'push' }}
@@ -185,6 +196,8 @@ jobs:
       MEDIAFORGE_TTS_MAX_WORKERS: '1'
       MEDIAFORGE_TTS_STRICT_CHUNK_ORDER: '1'
       MEDIAFORGE_STRICT_UNIQUE_MEDIA: '1'
+      MEDIAFORGE_ACTIVE_GTA_VI_BASELINE: '126'
+      MEDIAFORGE_DEBUG_SUBPROCESS_STDERR: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -200,12 +213,18 @@ jobs:
           python -m py_compile \
             public-worker-template/worker.py \
             public-worker-template/supabase_chunked.py \
-            public-worker-template/factory_worker.py
+            public-worker-template/factory_worker.py \
+            public-worker-template/factory_worker_media.py \
+            public-worker-template/dell_asset_client.py \
+            public-worker-template/dell_asset_client_v5.py \
+            public-worker-template/dell_asset_client_v6.py \
+            public-worker-template/dell_asset_client_v7.py \
+            public-worker-template/validate_render.py
       - name: Cache Chatterbox models
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: chatterbox-multilingual-v3-${{ runner.os }}-${{ runner.arch }}-clean-v1
+          key: chatterbox-multilingual-v3-${{ runner.os }}-${{ runner.arch }}-media-v2
       - name: Install production dependencies
         run: |
           set -euo pipefail
@@ -220,10 +239,9 @@ jobs:
           set -euo pipefail
           test -n "$MEDIAFORGE_CORE_KEY_B64" || { echo 'MEDIAFORGE_CORE_KEY_B64 is not configured'; exit 1; }
           mkdir -p .runtime/core-parts
-          CORE_BASE='encrypted-core/v7'
           for part in part-01a.b64 part-01b.b64 part-02.b64 part-03.b64 part-04.b64; do
-            test -s "$CORE_BASE/$part"
-            cp "$CORE_BASE/$part" ".runtime/core-parts/$part"
+            test -s "encrypted-core/v7/$part"
+            cp "encrypted-core/v7/$part" ".runtime/core-parts/$part"
           done
           cat .runtime/core-parts/part-01a.b64 \
               .runtime/core-parts/part-01b.b64 \
@@ -244,13 +262,15 @@ jobs:
           ffmpeg -y -loglevel error -i .runtime/voice-reference.ogg -vn -ac 1 -ar 24000 -c:a pcm_s16le .runtime/voice-reference.wav
           test -s .runtime/voice-reference.wav
           echo "MEDIAFORGE_VOICE_REFERENCE_PATH=$(realpath .runtime/voice-reference.wav)" >> "$GITHUB_ENV"
-      - name: Lease and render next factory job
+      - name: Lease, preflight media and render next factory job
         run: |
           set -euo pipefail
           export MEDIAFORGE_MUSIC_ENABLED=0
-          python public-worker-template/factory_worker.py \
+          python public-worker-template/factory_worker_media.py \
             --lane "${{ matrix.lane }}" \
             --locale "${{ matrix.locale }}" \
             --bundle "$MEDIAFORGE_BUNDLE_PATH" \
             --worker public-worker-template/worker.py \
+            --asset-client public-worker-template/dell_asset_client_v7.py \
+            --validator public-worker-template/validate_render.py \
             --output-dir "out/${{ matrix.lane }}"
